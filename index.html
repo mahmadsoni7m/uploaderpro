@@ -68,7 +68,50 @@ async function readActions(){
 }
 $('#readActions').onclick=readActions;
 function safeName(s){return s.replace(/^\/+|\/+$/g,'').split('/').filter(x=>x&&x!=='.'&&x!=='..').join('/')}
-$('#downloadSelected').onclick=async()=>{if(!S.selected.size)return status('#repoStatus','Аввал як ё якчанд repository интихоб кунед.','err');setBusy(true);try{for(const id of S.selected){const r=S.repos.find(x=>x.id===id);status('#repoStatus','ZIP сохта мешавад: '+r.full_name+' …');const res=await fetch(`${API}/repos/${r.full_name}/zipball/${encodeURIComponent(r.default_branch||'main')}`,{headers:{Authorization:'Bearer '+S.token,Accept:'application/vnd.github+json'}});if(!res.ok)throw Object.assign(new Error('Download '+r.full_name+': HTTP '+res.status),{status:res.status});const blob=await res.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=r.name+'-'+(r.default_branch||'main')+'.zip';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),30000)}status('#repoStatus','Дархости ZIP барои '+S.selected.size+' repository фиристода шуд. Агар браузер download-ҳои чандкаратаро манъ кунад, иҷозат диҳед.','ok')}catch(e){status('#repoStatus',friendly(e),'err')}finally{setBusy(false)}};
+async function fetchRepoArchive(repo, archive, progress){
+ const branch=repo.default_branch||'main';
+ const tree=await api('GET',`/repos/${repo.full_name}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+ if(tree.truncated)throw new Error(repo.full_name+': repository хеле калон аст; GitHub рӯйхати файлҳоро пурра барнагардонд.');
+ const entries=(tree.tree||[]).filter(x=>x.type==='blob'&&x.mode!=='120000'&&x.mode!=='160000'&&x.path&&!x.path.split('/').some(p=>p==='..'||p===''));
+ let done=0,index=0,failed=[];
+ await Promise.all(Array.from({length:Math.min(4,entries.length)},async()=>{
+  while(index<entries.length){
+   const item=entries[index++];
+   try{
+    const blob=await api('GET',`/repos/${repo.full_name}/git/blobs/${item.sha}`);
+    const raw=atob((blob.content||'').replace(/\\s/g,''));
+    const bytes=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+    archive.file(repo.name+'/'+item.path,bytes);
+   }catch(e){failed.push(item.path+': '+friendly(e))}
+   done++;progress(repo,done,entries.length);
+  }
+ }));
+ if(failed.length)throw new Error(repo.full_name+': '+failed.slice(0,3).join('; ')+(failed.length>3?' …':''));
+ return entries.length;
+}
+$('#downloadSelected').onclick=async()=>{
+ if(!S.selected.size)return status('#repoStatus','Аввал як ё якчанд repository интихоб кунед.','err');
+ if(typeof JSZip==='undefined')return status('#repoStatus','Китобхонаи сохтани ZIP бор нашуд. Интернетро санҷед ва саҳифаро нав кунед.','err');
+ setBusy(true);
+ try{
+  const zip=new JSZip(), repos=S.repos.filter(r=>S.selected.has(r.id));
+  let totalFiles=0;
+  for(let i=0;i<repos.length;i++){
+   const r=repos[i];
+   status('#repoStatus',`Хондани файлҳо: ${r.full_name} (${i+1}/${repos.length}) …`);
+   totalFiles+=await fetchRepoArchive(r,zip,(repo,done,total)=>status('#repoStatus',`Хондани ${repo.full_name}: ${done}/${total} файл`));
+  }
+  if(!totalFiles)throw new Error('Дар repository-ҳои интихобшуда ягон файл ёфт нашуд.');
+  status('#repoStatus','ZIP сохта мешавад…');
+  const blob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:5}},meta=>status('#repoStatus','ZIP сохта мешавад: '+Math.round(meta.percent)+'%'));
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download='github-repositories-'+new Date().toISOString().slice(0,10)+'.zip';
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  status('#repoStatus',`Тайёр ✓ ${repos.length} repository ва ${totalFiles} файл ба як ZIP ҷамъ карда шуд.`,'ok');
+ }catch(e){status('#repoStatus','ZIP сохта нашуд: '+friendly(e),'err')}
+ finally{setBusy(false)}
+};
 $('#deleteSelected').onclick=async()=>{const rs=S.repos.filter(r=>S.selected.has(r.id));if(!rs.length)return status('#repoStatus','Аввал repository интихоб кунед.','err');if(rs.some(r=>r.owner.login.toLowerCase()!==S.user.login.toLowerCase()))return status('#repoStatus','Барои бехатарӣ ин асбоб танҳо repository-и соҳиби аккаунти пайвастшударо нест мекунад.','err');const names=rs.map(r=>'• '+r.full_name).join('\n');if(!confirm('⚠️ ИН АМАЛ БАРГАРДОНДА НАМЕШАВАД!\n\nRepository-ҳои зерин доимӣ нест мешаванд:\n'+names+'\n\nБарои идома OK занед.'))return;if(!confirm('Бори дуюм тасдиқ кунед: '+rs.length+' repository-ро доимӣ нест кунам?'))return;setBusy(true);let deleted=[],failed=[];for(const r of rs){try{await api('DELETE',`/repos/${r.full_name}`);deleted.push(r.full_name);S.selected.delete(r.id);if(S.active?.id===r.id)S.active=null}catch(e){failed.push(r.full_name+': '+friendly(e))}}await loadRepos();status('#repoStatus',(deleted.length?'Нест шуд:\n'+deleted.join('\n')+'\n':'')+(failed.length?'Хатогиҳо:\n'+failed.join('\n'):'')||'Амалиёт анҷом ёфт.',failed.length?'err':'ok');setBusy(false)};
 const refreshFiles=()=>{const total=S.files.reduce((a,x)=>a+x.file.size,0);$('#fileInfo').textContent=S.files.length?`${S.files.length} файл · ${fmt(total)}\n`+S.files.slice(0,8).map(x=>x.path).join('\n')+(S.files.length>8?'\n…':''):''};
 function filesChanged(input,kind){input.onchange=()=>{S.files=Array.from(input.files).map(f=>({file:f,path:kind==='folder'?(f.webkitRelativePath||f.name):f.name}));['zipFile','files','folder'].filter(id=>id!==input.id).forEach(id=>$('#'+id).value='');refreshFiles()}}
